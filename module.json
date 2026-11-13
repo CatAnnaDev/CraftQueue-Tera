@@ -1,0 +1,9 @@
+{
+    "name": "craft-queue",
+    "author": "CatAnnaDev",
+    "description": "Endless/batch crafting with material-aware auto-stop, exact count, live progress and output value. Based on Endless Crafting by Bubble/TerableCoder.",
+    "version": "1.0.0",
+    "disableAutoUpdate": true,
+    "options": { "cliName": "Craft Queue", "guiName": "Craft queue", "settingsFile": "config.json" },
+    "dependencies": { "tera-game-state": "https://raw.githubusercontent.com/Kaseaa/tera-game-state/master/module.json" }
+}
