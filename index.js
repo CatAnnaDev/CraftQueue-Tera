@@ -9,9 +9,12 @@ module.exports = function CraftQueue(mod) {
 	const command = mod.command || mod.require.command;
 	const recipes = loadJson("recipes.json");
 	const items = loadJson("items.json");
+	const ppItems = loadJson("pp_items.json");
 	const STEPS_FILE = path.join(__dirname, "data", "steps.json");
+	const PRESETS_FILE = path.join(__dirname, "data", "presets.json");
 	const CONFIG_FILE = path.join(__dirname, "config.json");
 	let steps = loadFile(STEPS_FILE) || {};
+	let presets = loadFile(PRESETS_FILE) || {};
 	const cfg = Object.assign({ delay: 0, reUsePie: false, cureId: 0, ppThreshold: 1000, progressEvery: 25 }, readConfig());
 	mod.game.initialize("inventory");
 
@@ -41,7 +44,7 @@ module.exports = function CraftQueue(mod) {
 		extraDelay: 0,
 		timer: null,
 		guard: null,
-		chain: { names: [], counts: [], idx: -1, active: false }
+		chain: { list: [], idx: -1, active: false, name: null }
 	};
 
 	const stats = { crafts: 0, crits: 0, byRecipe: {} };
@@ -57,6 +60,9 @@ module.exports = function CraftQueue(mod) {
 	}
 	function saveSteps() {
 		try { fs.writeFileSync(STEPS_FILE, JSON.stringify(replaceBig(steps))); } catch (e) { mod.warn("steps save error: " + e.message); }
+	}
+	function savePresets() {
+		try { fs.writeFileSync(PRESETS_FILE, JSON.stringify(presets, null, 4)); } catch (e) { mod.warn("presets save error: " + e.message); }
 	}
 
 	function replaceBig(o) {
@@ -86,6 +92,32 @@ module.exports = function CraftQueue(mod) {
 
 	function invAmount(id) {
 		try { return mod.game.inventory.getTotalAmountInBagOrPockets(id); } catch (e) { return 0; }
+	}
+
+	function cureName(id) { return (ppItems[String(id)] && ppItems[String(id)].n) || nameOf(id); }
+	function curePP(id) { return ppItems[String(id)] ? ppItems[String(id)].pp : 0; }
+	function cureInBag(id) {
+		try { return mod.game.inventory.findInBagOrPockets(id); } catch (e) { return null; }
+	}
+	function chooseCure() {
+		if (cfg.cureId) { const f = cureInBag(cfg.cureId); if (f && f.amount > 0) return { id: cfg.cureId, dbid: f.dbid }; }
+		let best = null;
+		for (const idStr of Object.keys(ppItems)) {
+			const id = parseInt(idStr, 10);
+			const f = cureInBag(id);
+			if (f && f.amount > 0 && (!best || curePP(id) > best.pp)) best = { id, dbid: f.dbid, pp: curePP(id) };
+		}
+		return best;
+	}
+	function ppStatus() {
+		say(`PP: ${Number.isFinite(st.pp) ? st.pp : "?"} | seuil ${cfg.ppThreshold} | cure ${cfg.cureId ? cureName(cfg.cureId) : "auto"}`);
+		const rows = Object.keys(ppItems).map(k => ({ id: k, n: ppItems[k].n, pp: ppItems[k].pp })).sort((a, b) => b.pp - a.pp);
+		for (const r of rows) {
+			const f = cureInBag(parseInt(r.id, 10));
+			const have = f && f.amount > 0 ? "x" + f.amount : "-";
+			say(`  ${r.id}  +${r.pp} PP  ${r.n}  [${have}]`);
+		}
+		say("Set: craft pp <id|nom>  (auto-pioche n'importe quelle dispo si non defini)");
 	}
 
 	function identifyRecipe(ev) {
@@ -152,19 +184,26 @@ module.exports = function CraftQueue(mod) {
 	function pct(a, b) { return b ? Math.round((a / b) * 100) + "%" : "0%"; }
 
 	function stepEnd(reason) {
-		if (st.chain.active && st.chain.idx < st.chain.names.length - 1) {
+		if (st.chain.active && st.chain.idx < st.chain.list.length - 1) {
 			return advanceChain();
 		}
 		stop(reason);
 	}
 
+	function applyStepReagent(on) {
+		if (typeof on !== "boolean") return;
+		if (!reagent.field) { if (on) say("(reagent demande mais non calibre; lance: craft calibrate)"); return; }
+		reagent.on = on;
+	}
+
 	function advanceChain() {
 		st.chain.idx++;
-		const name = st.chain.names[st.chain.idx];
-		const count = st.chain.counts[st.chain.idx] || 0;
-		if (!steps[name]) return stop(`chain step "${name}" not learned`);
-		loadStep(name, count);
-		say(`Chain step ${st.chain.idx + 1}/${st.chain.names.length}: ${name}${count ? " x" + count : " (until out of mats)"}`);
+		const step = st.chain.list[st.chain.idx];
+		if (!recipes[String(step.recipeId)]) return stop(`chain step "${step.label}" unknown recipe`);
+		applyStepReagent(step.reagent);
+		loadRecipe(step.recipeId, step.count);
+		const tag = step.reagent === true ? " +reagent" : step.reagent === false ? " -reagent" : "";
+		say(`Chain step ${st.chain.idx + 1}/${st.chain.list.length}: ${step.label}${step.count ? " x" + step.count : " (until out of mats)"}${tag}`);
 		sendCraft();
 	}
 
@@ -270,11 +309,13 @@ module.exports = function CraftQueue(mod) {
 		}
 
 		if (st.pp < (cfg.ppThreshold || 1000)) {
-			if (!st.cureDbid) return stop("production points exhausted (set a cure: craft pp <item link>)");
-			say("Restoring production points.");
+			const cure = chooseCure();
+			if (!cure) return stop("production points exhausted (aucune potion PP en sac; craft pp pour la liste)");
+			if (cure.id !== cfg.cureId) { cfg.cureId = cure.id; saveConfig(); }
+			say(`Restoring PP: ${cureName(cure.id)} (+${curePP(cure.id)}).`);
 			st.extraDelay += 10;
 			mod.setTimeout(() => {
-				useItem(cfg.cureId, st.cureDbid);
+				useItem(cure.id, cure.dbid);
 				mod.hookOnce("S_FATIGABILITY_POINT", defVer("S_FATIGABILITY_POINT", 3), () => { if (st.enabled) sendCraft(); });
 			}, 5 + st.extraDelay);
 		} else {
@@ -293,19 +334,133 @@ module.exports = function CraftQueue(mod) {
 		else say(`Ready${st.target ? " for " + st.target : ""}: craft one item manually to start.`);
 	}
 
-	function startChain(args) {
-		const names = [], counts = [];
-		for (const a of args) {
-			const [n, c] = a.split(":");
-			const key = Object.keys(steps).find(k => k.toLowerCase() === n.toLowerCase());
-			if (!key) return say(`Step "${n}" not learned. Learn it: craft one ${n} then "craft learn ${n}".`);
-			names.push(key); counts.push(parseInt(c, 10) || 0);
+	function parseStepToken(tok) {
+		const parts = tok.split(":");
+		const name = parts[0];
+		let count = 0, reagent;
+		for (const p of parts.slice(1)) {
+			const low = p.toLowerCase();
+			if (low === "r" || low === "reagent") reagent = true;
+			else if (low === "nr" || low === "noreagent") reagent = false;
+			else { const n = parseInt(p, 10); if (Number.isInteger(n) && n > 0) count = n; }
 		}
-		if (!names.length) return say("Usage: craft chain <name1> <name2:count> ...");
-		st.chain = { names, counts, idx: -1, active: true };
+		return { name, count, reagent };
+	}
+
+	function buildRecipePacket(recipeId) { return { recipe: Number(recipeId), unk: 0 }; }
+
+	function craftLabel(recipeId) {
+		const rec = recipes[String(recipeId)];
+		const resId = rec && rec.r[0];
+		return (resId && items[resId] && items[resId].n) || ("recipe " + recipeId);
+	}
+
+	function recipeIdForName(name) {
+		const lc = name.toLowerCase();
+		let partial = null;
+		for (const rid of Object.keys(recipes)) {
+			const resId = recipes[rid].r[0];
+			const nm = items[resId] && items[resId].n;
+			if (!nm) continue;
+			const nl = nm.toLowerCase();
+			if (nl === lc) return rid;
+			if (!partial && nl.includes(lc)) partial = rid;
+		}
+		return partial;
+	}
+
+	function resolveCraftByName(str) {
+		const name = str.trim();
+		if (/^\d+$/.test(name)) {
+			if (recipes[name]) return { recipeId: name, label: craftLabel(name) };
+			return { error: `Recipe id ${name} unknown.` };
+		}
+		const stepKey = Object.keys(steps).find(k => k.toLowerCase() === name.toLowerCase());
+		if (stepKey && steps[stepKey].recipeId) return { recipeId: String(steps[stepKey].recipeId), label: stepKey };
+		const rid = recipeIdForName(name);
+		if (rid) return { recipeId: rid, label: craftLabel(rid) };
+		return { error: `Unknown craft "${name}" (id de recette, nom de resultat, ou step appris). Cherche: craft recipes ${name}` };
+	}
+
+	function resolveSteps(tokens) {
+		const list = [];
+		for (const t of tokens) {
+			const s = parseStepToken(t);
+			const r = resolveCraftByName(s.name);
+			if (r.error) return { error: r.error };
+			list.push({ recipeId: r.recipeId, label: r.label, count: s.count, reagent: s.reagent });
+		}
+		return { list };
+	}
+
+	function stepLabel(s) {
+		return s.label + (s.count ? ":" + s.count : "") + (s.reagent === true ? "+r" : s.reagent === false ? "-r" : "");
+	}
+
+	function loadRecipe(recipeId, count) {
+		st.craftItem = buildRecipePacket(recipeId);
+		st.recipe = recipes[String(recipeId)] || null;
+		st.recipeKey = "recipe";
+		st.currentName = craftLabel(recipeId);
+		st.target = count || 0;
+		st.done = 0;
+		st.runCrits = 0;
+		st.extraDelay = 0;
+	}
+
+	function runChainList(list, presetName) {
+		st.chain = { list, idx: -1, active: true, name: presetName || null };
 		st.enabled = true;
-		say(`Chain: ${names.join(" -> ")}`);
+		say(`${presetName ? 'Preset "' + presetName + '"' : "Chain"}: ${list.map(stepLabel).join(" -> ")}`);
 		advanceChain();
+	}
+
+	function startChain(args) {
+		if (!args.length) return say("Usage: craft chain <name1> <name2:count> ... (suffixe :r reagent, :nr sans)");
+		const r = resolveSteps(args);
+		if (r.error) return say(r.error);
+		runChainList(r.list, null);
+	}
+
+	function presetCmd(sub, args) {
+		if (sub === "save") {
+			const name = args.shift();
+			if (!name || !args.length) return say("Usage: craft preset save <nom> <step1> <step2:count:r> ...");
+			const r = resolveSteps(args);
+			if (r.error) return say(r.error);
+			presets[name] = r.list;
+			savePresets();
+			return say(`Preset "${name}" saved: ${r.list.map(stepLabel).join(" -> ")}`);
+		}
+		if (sub === "run" || sub === "start") {
+			const key = args[0] && Object.keys(presets).find(k => k.toLowerCase() === args[0].toLowerCase());
+			if (!key) return say(`Preset "${args[0] || ""}" not found. craft preset list`);
+			const missing = presets[key].filter(s => !recipes[String(s.recipeId)]);
+			if (missing.length) return say(`Preset "${key}" has unknown recipes: ${missing.map(s => s.label).join(", ")}`);
+			return runChainList(presets[key].map(s => ({ recipeId: s.recipeId, label: s.label, count: s.count, reagent: s.reagent })), key);
+		}
+		if (sub === "list") {
+			const keys = Object.keys(presets);
+			if (!keys.length) return say("No presets. craft preset save <nom> <steps...>");
+			say(`Presets (${keys.length}):`);
+			return keys.forEach(k => say(`  ${k}: ${presets[k].map(stepLabel).join(" -> ")}`));
+		}
+		if (sub === "del" || sub === "delete") {
+			const key = args[0] && Object.keys(presets).find(k => k.toLowerCase() === args[0].toLowerCase());
+			if (!key) return say(`Preset "${args[0] || ""}" not found.`);
+			delete presets[key]; savePresets(); return say(`Deleted preset "${key}".`);
+		}
+		if (sub === "reagent") {
+			const key = args[0] && Object.keys(presets).find(k => k.toLowerCase() === args[0].toLowerCase());
+			if (!key) return say(`Preset "${args[0] || ""}" not found.`);
+			const q = (args[1] || "").toLowerCase();
+			const step = presets[key].find(s => s.label.toLowerCase() === q || String(s.recipeId) === q);
+			if (!step) return say(`Step "${args[1] || ""}" not in preset "${key}".`);
+			step.reagent = args[2] === "on" ? true : args[2] === "off" ? false : undefined;
+			savePresets();
+			return say(`Preset "${key}" step "${step.label}" reagent: ${step.reagent === true ? "on" : step.reagent === false ? "off" : "default"}`);
+		}
+		say("craft preset save|run|list|del|reagent <...>");
 	}
 
 	function isObj(v) { return v && typeof v === "object"; }
@@ -336,6 +491,37 @@ module.exports = function CraftQueue(mod) {
 			begin(runs);
 		},
 		chain(...args) { startChain(args); },
+		preset(sub, ...args) { presetCmd(sub, args); },
+		make(...args) {
+			if (!args.length) return say("Usage: craft make <id|nom de resultat> (puis N optionnel: craft make Elixir 50)");
+			let count = 0;
+			if (args.length > 1 && /^\d+$/.test(args[args.length - 1])) count = parseInt(args.pop(), 10);
+			const r = resolveCraftByName(args.join(" "));
+			if (r.error) return say(r.error);
+			st.chain.active = false;
+			loadRecipe(r.recipeId, count);
+			st.enabled = true;
+			const runs = materialRuns(st.recipe);
+			if (runs <= 0) return stop(`no materials for ${r.label}`);
+			say(`Crafting ${r.label}${count ? " x" + count : runs !== Infinity ? " (max " + runs + ")" : " endlessly"}.`);
+			sendCraft();
+		},
+		recipes(...args) {
+			const q = args.join(" ").toLowerCase();
+			const hits = Object.keys(recipes).filter(rid => {
+				if (!q) return true;
+				if (String(rid).includes(q)) return true;
+				const nm = craftLabel(rid).toLowerCase();
+				return nm.includes(q);
+			});
+			if (!hits.length) return say(`No recipe matches "${q}".`);
+			say(`${hits.length} recipe(s)${hits.length > 30 ? " (first 30)" : ""}:`);
+			for (const rid of hits.slice(0, 30)) {
+				const r = recipes[rid];
+				const mats = r.m.map(([id, c]) => `${nameOf(id)}x${c}`).join(", ");
+				say(`  ${rid}  ${craftLabel(rid)}  <- ${mats}`);
+			}
+		},
 		learn(name) {
 			if (!name) return say("Usage: craft learn <name> (then craft that item once)");
 			learnPending = name;
@@ -365,7 +551,7 @@ module.exports = function CraftQueue(mod) {
 			statsText().forEach(say);
 		},
 		status() {
-			say(`Craft queue: ${st.enabled ? "ON" : "off"}${st.chain.active ? " [chain " + (st.chain.idx + 1) + "/" + st.chain.names.length + "]" : ""} | step ${statName()} ${st.done}${st.target ? "/" + st.target : ""} | pp ${Number.isFinite(st.pp) ? st.pp : "?"} | reagent ${reagent.field ? (reagent.on ? "on" : "off") : "n/a"}`);
+			say(`Craft queue: ${st.enabled ? "ON" : "off"}${st.chain.active ? " [" + (st.chain.name ? st.chain.name + " " : "chain ") + (st.chain.idx + 1) + "/" + st.chain.list.length + "]" : ""} | step ${statName()} ${st.done}${st.target ? "/" + st.target : ""} | pp ${Number.isFinite(st.pp) ? st.pp : "?"} | reagent ${reagent.field ? (reagent.on ? "on" : "off") : "n/a"}`);
 			say(infoText());
 		},
 		info() { say(infoText()); },
@@ -374,15 +560,26 @@ module.exports = function CraftQueue(mod) {
 			const d = parseInt(n, 10);
 			if (Number.isInteger(d) && d >= 0) { cfg.delay = d; saveConfig(); say(`Delay ${d} ms.`); } else say(`Current delay ${cfg.delay} ms.`);
 		},
-		pp(link) {
-			const id = /#(\d+)@/.exec(link || ""), dbid = /@(\d+)@/.exec(link || "");
-			if (id && dbid) { cfg.cureId = parseInt(id[1], 10); st.cureDbid = BigInt(parseInt(dbid[1], 10)); saveConfig(); say(`PP cure set: ${nameOf(cfg.cureId)}.`); }
-			else say("Link the cure item: craft pp <item link>");
+		pp(arg) {
+			if (!arg) return ppStatus();
+			if (arg.toLowerCase() === "auto") { cfg.cureId = 0; saveConfig(); return say("PP cure: auto (pioche la plus grosse dispo)."); }
+			const link = /#(\d+)@(\d+)@/.exec(arg);
+			if (link) { cfg.cureId = parseInt(link[1], 10); saveConfig(); return say(`PP cure set: ${cureName(cfg.cureId)}.`); }
+			let id = parseInt(arg, 10);
+			if (!Number.isInteger(id)) {
+				const hit = Object.keys(ppItems).find(k => ppItems[k].n.toLowerCase().includes(arg.toLowerCase()));
+				if (!hit) return say(`Potion PP inconnue "${arg}". craft pp (sans arg) pour la liste.`);
+				id = parseInt(hit, 10);
+			}
+			if (!ppItems[String(id)]) return say(`${id} n'est pas une potion PP connue.`);
+			cfg.cureId = id; saveConfig();
+			const f = cureInBag(id);
+			say(`PP cure set: ${cureName(id)} (+${curePP(id)} PP)${f && f.amount > 0 ? ", en sac x" + f.amount : " (aucune en sac)"}.`);
 		},
 		$default(arg) {
 			const n = parseInt(arg, 10);
 			if (Number.isInteger(n) && n > 0) return begin(n);
-			say("craft (toggle) | <N> | max | chain <a b c> | learn <name> | steps | forget <name> | reagent on|off | calibrate | stats [reset] | status | info | delay <ms> | pie | pp <link>");
+			say("craft (toggle) | <N> | make <id|nom> [N] | recipes [search] | max | chain <a b:count c:nr> | preset save|run|list|del|reagent | reagent on|off | calibrate | stats [reset] | status | info | delay <ms> | pie | pp [id|nom|auto] | learn/steps/forget (optionnel)");
 		}
 	});
 

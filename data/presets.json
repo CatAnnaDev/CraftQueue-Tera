@@ -1,0 +1,24 @@
+{
+    "gems": [
+        {
+            "recipeId": "28604",
+            "label": "Ruby",
+            "count": 0
+        },
+        {
+            "recipeId": "28605",
+            "label": "Sapphire",
+            "count": 0
+        },
+        {
+            "recipeId": "28606",
+            "label": "Emerald",
+            "count": 0
+        },
+        {
+            "recipeId": "28607",
+            "label": "Diamond",
+            "count": 0
+        }
+    ]
+}
